@@ -1,0 +1,28 @@
+{
+  "name": "@infra-commons/d1-field-crypto",
+  "version": "1.0.0",
+  "description": "AES-256-GCM field-level encryption helper for Cloudflare D1 Workers apps",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/infra-commons/d1-field-crypto.git"
+  }
+}
