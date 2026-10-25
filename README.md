@@ -6,6 +6,17 @@ Encrypts individual columns before writing to D1 and decrypts on read. Adds appl
 protection on top of D1's platform-level encryption at rest — guards against leaked DB exports
 and console/insider access to row contents.
 
+## Threat model
+
+The attacker can read **and write** D1 rows (leaked export, console access, SQL injection in the
+app, a leaked API token) but does not hold the keyring. Every ciphertext is bound to a
+`FieldContext` — `{ table, column, row }` — as AES-GCM associated data, so a value only decrypts
+in the cell it was written to. Copying a ciphertext into another row, column or table makes
+decryption fail instead of returning another user's data.
+
+Not covered: replaying an **older** value of the same cell (rollback), and anything an attacker can
+do with the keyring itself.
+
 ## Quick start
 
 ```bash
@@ -52,22 +63,31 @@ echo '<base64-key>' | wrangler secret put D1_EMAIL_INDEX_KEY
 
 ## Encrypting fields
 
+Every call takes a `FieldContext` naming the table, the column and a **stable row id**. The row id
+must be known before the write, so use an application-assigned primary key (e.g.
+`crypto.randomUUID()`), not an `AUTOINCREMENT` id. Use the same context on read.
+
 ```typescript
 // Write path
-const encEmail = await encryptField(user.email, keyring);
-const emailBidx = await blindIndex(user.email, emailIdxKey);
+const id = crypto.randomUUID();
+const ctx = (column: string) => ({ table: "users", column, row: id });
 
 await db.prepare(
-  "INSERT INTO users (email_enc, email_bidx, name_enc) VALUES (?, ?, ?)"
-).bind(encEmail, emailBidx, await encryptField(user.name, keyring)).run();
+  "INSERT INTO users (id, email_enc, email_bidx, name_enc) VALUES (?, ?, ?, ?)"
+).bind(
+  id,
+  await encryptField(user.email, keyring, ctx("email_enc")),
+  await blindIndex(user.email, emailIdxKey),
+  await encryptField(user.name, keyring, ctx("name_enc")),
+).run();
 
 // Read path
-const row = await db.prepare("SELECT email_enc, name_enc FROM users WHERE email_bidx = ?")
+const row = await db.prepare("SELECT id, email_enc, name_enc FROM users WHERE email_bidx = ?")
   .bind(await blindIndex(lookupEmail, emailIdxKey))
   .first();
 
-const email = await decryptField(row.email_enc, keyring);
-const name  = await decryptField(row.name_enc, keyring);
+const email = await decryptField(row.email_enc, keyring, { table: "users", column: "email_enc", row: row.id });
+const name  = await decryptField(row.name_enc, keyring, { table: "users", column: "name_enc", row: row.id });
 ```
 
 ## Blind index (equality lookups on encrypted columns)
@@ -80,17 +100,41 @@ a deterministic HMAC-SHA256 of the normalised value, stored in a sibling `email_
 - The index key must be **different** from the encryption keyring key.
 - The helper normalises input (lowercase + trim) before hashing — `user@EXAMPLE.COM` and
   `user@example.com` produce the same index.
+- Use a separate index key per indexed column.
+
+The blind index is **not** bound to the row: it must be the same for equal values across rows, or
+lookup is impossible. So a lookup by index only tells you which row *claims* the value. Before
+acting on the match (sending a login or reset email, merging accounts), decrypt the row's field
+with its own context and check it equals the normalised lookup value:
+
+```typescript
+const stored = await decryptField(row.email_enc, keyring, { table: "users", column: "email_enc", row: row.id });
+if (stored.toLowerCase().trim() !== lookupEmail.toLowerCase().trim()) throw new Error("index mismatch");
+// send mail to `stored`, never to the address the request supplied
+```
 
 ## Wire format
 
-Each encrypted field is a base64 string:
+Each encrypted field is a base64 string. Format v2 (all new writes):
 
 ```
-[version: 1 byte] [IV: 12 bytes] [ciphertext + GCM auth tag: variable]
+[0x00] [format: 0x02] [key version: 1 byte] [IV: 12 bytes] [ciphertext + GCM auth tag]
 ```
 
-The version byte enables key rotation: the helper reads the version from the blob and selects the
-matching key from the keyring automatically.
+The associated data is the 3-byte header followed by `JSON.stringify([table, column, String(row)])`.
+The key-version byte drives rotation: the helper selects the matching key from the keyring.
+
+**Legacy v1** (written by 1.x, read-only): `[key version] [IV] [ciphertext + tag]`, no associated
+data. Key versions are 1–255, so a leading `0x00` always marks v2+. Legacy values still decrypt
+(the context is validated but not bound), so they remain movable until re-encrypted.
+
+### Migrating from 1.x
+
+1. Upgrade and pass a context to every `encryptField` / `decryptField` call. New writes are v2.
+2. Re-encrypt existing values: on read (`if (isLegacyFormat(v))` → decrypt, `encryptField` with the
+   row's context, write back) and/or with a backfill over each encrypted column.
+3. When `SELECT` finds no legacy values left, pass `{ allowLegacy: false }` to `decryptField` so a
+   copied-in legacy value is rejected.
 
 ## What NOT to encrypt
 
@@ -108,7 +152,7 @@ Phase the migration to avoid downtime:
 - On read: prefer `email_enc` if populated, fall back to `email`.
 - Deploy and verify.
 
-**Phase B — backfill (Kevin-gated, run manually):**
+**Phase B — backfill (operator-gated, run manually):**
 ```bash
 # Export a backup first
 wrangler d1 export <DB_NAME> --remote --output backup-$(date +%Y%m%d).sql
@@ -128,11 +172,18 @@ node --env-file=.dev.vars scripts/backfill-encrypt.ts
 // Parse and import a raw keyring object (call once; cache the result)
 resolveKeyring(raw: Record<string, string>): Promise<ResolvedKeyring>
 
-// Encrypt a UTF-8 string with the active key; returns a base64 blob
-encryptField(plaintext: string, keyring: ResolvedKeyring): Promise<string>
+type FieldContext = { table: string; column: string; row: string | number }
 
-// Decrypt a base64 blob; auto-selects the key version stored in the blob
-decryptField(encoded: string, keyring: ResolvedKeyring): Promise<string>
+// Encrypt a UTF-8 string with the active key, bound to `context`; returns a base64 v2 blob
+encryptField(plaintext: string, keyring: ResolvedKeyring, context: FieldContext): Promise<string>
+
+// Decrypt with the same context; auto-selects the key version stored in the blob.
+// Legacy v1 blobs decrypt unless options.allowLegacy === false.
+decryptField(encoded: string, keyring: ResolvedKeyring, context: FieldContext,
+             options?: { allowLegacy?: boolean }): Promise<string>
+
+// True if the blob is legacy v1 and should be re-encrypted
+isLegacyFormat(encoded: string): boolean
 
 // Import a 256-bit HMAC key for blind-index use
 importIndexKey(base64Key: string): Promise<CryptoKey>

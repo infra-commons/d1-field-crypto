@@ -5,6 +5,8 @@ import {
   decryptField,
   importIndexKey,
   blindIndex,
+  isLegacyFormat,
+  type FieldContext,
   type KeyringRaw,
 } from "../src/index.js";
 
@@ -12,6 +14,18 @@ import {
 const KEY_V1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; // 32 zero bytes
 const KEY_V2 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="; // 32 one bytes
 const INDEX_KEY = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="; // 32 two bytes
+const CTX: FieldContext = { table: "users", column: "email_enc", row: "u-1" };
+
+const bytes = (b64: string) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+const b64 = (u: Uint8Array) => btoa(String.fromCharCode(...u));
+
+/** Build a LEGACY v1 blob exactly as the pre-v2 encoder did (no associated data). */
+async function legacyBlob(plaintext: string, keyB64: string, version: number): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", bytes(keyB64), { name: "AES-GCM" }, false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plaintext)));
+  return b64(new Uint8Array([version, ...iv, ...ct]));
+}
 
 describe("resolveKeyring", () => {
   it("parses a single-version keyring and sets activeVersion", async () => {
@@ -44,64 +58,142 @@ describe("resolveKeyring", () => {
 describe("encryptField / decryptField", () => {
   it("round-trips a plaintext string", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1 });
-    const blob = await encryptField("hello@example.com", kr);
-    const result = await decryptField(blob, kr);
+    const blob = await encryptField("hello@example.com", kr, CTX);
+    const result = await decryptField(blob, kr, CTX);
     expect(result).toBe("hello@example.com");
   });
 
   it("produces different ciphertexts for the same plaintext (random IV)", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1 });
-    const b1 = await encryptField("same", kr);
-    const b2 = await encryptField("same", kr);
+    const b1 = await encryptField("same", kr, CTX);
+    const b2 = await encryptField("same", kr, CTX);
     expect(b1).not.toBe(b2);
   });
 
-  it("stores the key version in byte 0 of the blob", async () => {
+  it("writes the v2 header: marker 0x00, format 2, key version", async () => {
     const kr = await resolveKeyring({ "2": KEY_V2 });
-    const blob = await encryptField("test", kr);
-    const bytes = Uint8Array.from(atob(blob), (c) => c.charCodeAt(0));
-    expect(bytes[0]).toBe(2);
+    const blob = bytes(await encryptField("test", kr, CTX));
+    expect([blob[0], blob[1], blob[2]]).toEqual([0, 2, 2]);
+    expect(isLegacyFormat(b64(blob))).toBe(false);
   });
 
   it("decrypts a v1 blob after key rotation to v2", async () => {
     const kr1 = await resolveKeyring({ "1": KEY_V1 });
-    const blob = await encryptField("sensitive", kr1);
+    const blob = await encryptField("sensitive", kr1, CTX);
 
     // Simulate rotation: add v2 — old v1 blob should still decrypt
     const kr2 = await resolveKeyring({ "1": KEY_V1, "2": KEY_V2 });
-    const result = await decryptField(blob, kr2);
+    const result = await decryptField(blob, kr2, CTX);
     expect(result).toBe("sensitive");
   });
 
   it("new encrypts with the active (higher) version after rotation", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1, "2": KEY_V2 });
-    const blob = await encryptField("post-rotation", kr);
-    const bytes = Uint8Array.from(atob(blob), (c) => c.charCodeAt(0));
-    expect(bytes[0]).toBe(2); // active = v2
+    const blob = await encryptField("post-rotation", kr, CTX);
+    expect(bytes(blob)[2]).toBe(2); // active = v2
   });
 
   it("throws when decrypting with a keyring missing the blob's key version", async () => {
     const kr1 = await resolveKeyring({ "1": KEY_V1 });
-    const blob = await encryptField("x", kr1);
+    const blob = await encryptField("x", kr1, CTX);
 
     const kr2 = await resolveKeyring({ "2": KEY_V2 }); // v1 removed
-    await expect(decryptField(blob, kr2)).rejects.toThrow("version 1");
+    await expect(decryptField(blob, kr2, CTX)).rejects.toThrow("version 1");
   });
 
   it("throws on a tampered (too-short) blob", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1 });
-    await expect(decryptField(btoa("short"), kr)).rejects.toThrow("too short");
+    await expect(decryptField(btoa("short"), kr, CTX)).rejects.toThrow("too short");
   });
 
   it("round-trips unicode and multi-line text", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1 });
     const text = "田中\nコーチメモ: 体重 65.2kg\n🏋️";
-    expect(await decryptField(await encryptField(text, kr), kr)).toBe(text);
+    expect(await decryptField(await encryptField(text, kr, CTX), kr, CTX)).toBe(text);
   });
 
   it("round-trips an empty string", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1 });
-    expect(await decryptField(await encryptField("", kr), kr)).toBe("");
+    expect(await decryptField(await encryptField("", kr, CTX), kr, CTX)).toBe("");
+  });
+});
+
+describe("context binding", () => {
+  it("round-trips with a numeric row id", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const ctx = { table: "users", column: "ssn_enc", row: 42 };
+    expect(await decryptField(await encryptField("123-45-6789", kr, ctx), kr, ctx)).toBe("123-45-6789");
+  });
+
+  it.each([
+    ["row", { ...CTX, row: "u-2" }],
+    ["column", { ...CTX, column: "name_enc" }],
+    ["table", { ...CTX, table: "admins" }],
+  ])("rejects a blob decrypted under the wrong %s", async (_, wrong) => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const blob = await encryptField("secret", kr, CTX);
+    await expect(decryptField(blob, kr, wrong)).rejects.toThrow();
+  });
+
+  it("does not let context parts run together", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const blob = await encryptField("x", kr, { table: "a|b", column: "c", row: 1 });
+    await expect(decryptField(blob, kr, { table: "a", column: "b|c", row: 1 })).rejects.toThrow();
+  });
+
+  it("requires a complete context", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    await expect(encryptField("x", kr, { ...CTX, row: "" })).rejects.toThrow("FieldContext.row");
+    // @ts-expect-error — untyped callers must fail closed
+    await expect(encryptField("x", kr)).rejects.toThrow("FieldContext");
+    const blob = await encryptField("x", kr, CTX);
+    // @ts-expect-error — missing column
+    await expect(decryptField(blob, kr, { table: "users", row: 1 })).rejects.toThrow("FieldContext.column");
+  });
+
+  it("rejects an unknown format version", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const blob = bytes(await encryptField("x", kr, CTX));
+    blob[1] = 3;
+    await expect(decryptField(b64(blob), kr, CTX)).rejects.toThrow("Unsupported blob format 3");
+  });
+
+  it("does not decrypt a v2 blob with its header stripped (no downgrade to legacy)", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const stripped = b64(bytes(await encryptField("x", kr, CTX)).slice(2));
+    expect(isLegacyFormat(stripped)).toBe(true);
+    await expect(decryptField(stripped, kr, CTX)).rejects.toThrow();
+  });
+
+  it("does not put key material or plaintext in errors", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const blob = await encryptField("plain-secret", kr, CTX);
+    const err = await decryptField(blob, kr, { ...CTX, row: "u-9" }).catch((e: Error) => e);
+    expect(String(err)).not.toContain("plain-secret");
+    expect(String(err)).not.toContain(KEY_V1);
+  });
+});
+
+describe("LEGACY v1 blobs", () => {
+  it("still decrypt, under any context, and report isLegacyFormat", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1, "2": KEY_V2 });
+    const old = await legacyBlob("legacy@example.com", KEY_V1, 1);
+    expect(isLegacyFormat(old)).toBe(true);
+    expect(await decryptField(old, kr, CTX)).toBe("legacy@example.com");
+  });
+
+  it("migrate by re-encrypting to v2", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const old = await legacyBlob("migrate-me", KEY_V1, 1);
+    const fresh = await encryptField(await decryptField(old, kr, CTX), kr, CTX);
+    expect(isLegacyFormat(fresh)).toBe(false);
+    expect(await decryptField(fresh, kr, CTX, { allowLegacy: false })).toBe("migrate-me");
+  });
+
+  it("are rejected when allowLegacy is false", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const old = await legacyBlob("x", KEY_V1, 1);
+    await expect(decryptField(old, kr, CTX, { allowLegacy: false })).rejects.toThrow("allowLegacy");
   });
 });
 
