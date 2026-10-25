@@ -1,6 +1,6 @@
 {
   "name": "@infra-commons/d1-field-crypto",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "AES-256-GCM field-level encryption helper for Cloudflare D1 Workers apps",
   "type": "module",
   "main": "./dist/index.js",

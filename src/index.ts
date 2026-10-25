@@ -1,14 +1,37 @@
 /**
  * d1-field-crypto — AES-256-GCM field-level encryption for Cloudflare D1 Workers apps.
  *
- * Blob wire format (base64-encoded):
- *   [version: 1 byte] [iv: 12 bytes] [ciphertext + GCM auth tag: variable]
+ * Blob wire format v2 (base64-encoded), written by `encryptField`:
+ *   [0x00] [format: 0x02] [key version: 1 byte] [iv: 12 bytes] [ciphertext + GCM auth tag]
+ * The GCM associated data is the 3-byte header plus the encoded `FieldContext`, so a blob only
+ * decrypts under the table/column/row it was written for.
+ *
+ * LEGACY v1 format (read-only, no associated data):
+ *   [key version: 1 byte] [iv: 12 bytes] [ciphertext + GCM auth tag]
+ * Key versions are 1–255, so a leading 0x00 always means a versioned (v2+) blob.
  *
  * Key management: supply a JSON keyring {"1": "<base64-256-bit-key>", "2": "..."}.
  * The highest version number is the active encryption key; all versions can decrypt.
  */
 
 const IV_SIZE = 12;
+const TAG_SIZE = 16;
+const FORMAT_MARKER = 0x00;
+const FORMAT_V2 = 0x02;
+const V2_HEADER_SIZE = 3;
+
+/** Where a field lives. Required on every encrypt/decrypt; bound to the ciphertext as GCM AAD. */
+export interface FieldContext {
+  table: string;
+  column: string;
+  /** Stable row identifier assigned before the write (e.g. a UUID primary key). */
+  row: string | number;
+}
+
+export interface DecryptOptions {
+  /** Accept LEGACY v1 blobs (no context binding). Default true; set false once migrated. */
+  allowLegacy?: boolean;
+}
 
 /** Raw keyring as stored in a Worker secret: version number → base64-encoded 256-bit key. */
 export type KeyringRaw = Record<string, string>;
@@ -45,45 +68,102 @@ export async function resolveKeyring(raw: KeyringRaw): Promise<ResolvedKeyring> 
   return { keys, activeVersion };
 }
 
+function encodeContext(context: FieldContext): Uint8Array<ArrayBuffer> {
+  if (!context || typeof context !== "object") throw new Error("A FieldContext is required");
+  const parts = [context.table, context.column, context.row];
+  const names = ["table", "column", "row"];
+  parts.forEach((p, i) => {
+    if ((typeof p !== "string" && typeof p !== "number") || String(p) === "") {
+      throw new Error(`FieldContext.${names[i]} must be a non-empty string or number`);
+    }
+  });
+  return new TextEncoder().encode(JSON.stringify(parts.map(String)));
+}
+
+function associatedData(header: Uint8Array, context: FieldContext): Uint8Array<ArrayBuffer> {
+  const ctx = encodeContext(context);
+  const aad = new Uint8Array(header.byteLength + ctx.byteLength);
+  aad.set(header);
+  aad.set(ctx, header.byteLength);
+  return aad;
+}
+
+function decodeBlob(encoded: string): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+}
+
+/** True if `encoded` is a LEGACY v1 blob that should be re-encrypted with `encryptField`. */
+export function isLegacyFormat(encoded: string): boolean {
+  return decodeBlob(encoded)[0] !== FORMAT_MARKER;
+}
+
 /**
- * Encrypt a plaintext string with the active key in the keyring.
- * @returns  Base64-encoded blob: [version(1)] [iv(12)] [ciphertext+tag]
+ * Encrypt a plaintext string with the active key, bound to `context`.
+ * @returns  Base64-encoded v2 blob (see wire format above).
  */
-export async function encryptField(plaintext: string, keyring: ResolvedKeyring): Promise<string> {
+export async function encryptField(
+  plaintext: string,
+  keyring: ResolvedKeyring,
+  context: FieldContext,
+): Promise<string> {
   const key = keyring.keys.get(keyring.activeVersion);
   if (!key) throw new Error(`Active key version ${keyring.activeVersion} not in keyring`);
 
+  const header = new Uint8Array([FORMAT_MARKER, FORMAT_V2, keyring.activeVersion]);
+  const additionalData = associatedData(header, context);
   const iv = crypto.getRandomValues(new Uint8Array(IV_SIZE));
   const encoded = new TextEncoder().encode(plaintext);
 
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData }, key, encoded);
 
-  const blob = new Uint8Array(1 + IV_SIZE + ciphertext.byteLength);
-  blob[0] = keyring.activeVersion;
-  blob.set(iv, 1);
-  blob.set(new Uint8Array(ciphertext), 1 + IV_SIZE);
+  const blob = new Uint8Array(V2_HEADER_SIZE + IV_SIZE + ciphertext.byteLength);
+  blob.set(header);
+  blob.set(iv, V2_HEADER_SIZE);
+  blob.set(new Uint8Array(ciphertext), V2_HEADER_SIZE + IV_SIZE);
 
   return btoa(String.fromCharCode(...blob));
 }
 
 /**
- * Decrypt a base64 blob produced by `encryptField`.
- * Looks up the key version stored in the blob — supports any version in the keyring.
+ * Decrypt a base64 blob produced by `encryptField`, using the same `context` it was written with.
+ * Selects the key version stored in the blob. LEGACY v1 blobs decrypt without context binding
+ * unless `allowLegacy` is false.
  */
-export async function decryptField(encoded: string, keyring: ResolvedKeyring): Promise<string> {
-  const blob = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
-  if (blob.byteLength < 1 + IV_SIZE + 16) {
-    throw new Error("Blob too short to be a valid encrypted field");
+export async function decryptField(
+  encoded: string,
+  keyring: ResolvedKeyring,
+  context: FieldContext,
+  options: DecryptOptions = {},
+): Promise<string> {
+  const blob = decodeBlob(encoded);
+  let version: number;
+  let offset: number;
+  let additionalData: Uint8Array<ArrayBuffer> | undefined;
+
+  if (blob[0] === FORMAT_MARKER) {
+    if (blob[1] !== FORMAT_V2) throw new Error(`Unsupported blob format ${blob[1]}`);
+    version = blob[2];
+    offset = V2_HEADER_SIZE;
+    additionalData = associatedData(blob.slice(0, V2_HEADER_SIZE), context);
+  } else {
+    // LEGACY v1 format: no associated data. Kept so existing rows can be read and migrated.
+    if (options.allowLegacy === false) throw new Error("Legacy v1 blob rejected (allowLegacy: false)");
+    encodeContext(context);
+    version = blob[0];
+    offset = 1;
   }
 
-  const version = blob[0];
-  const iv = blob.slice(1, 1 + IV_SIZE);
-  const ciphertext = blob.slice(1 + IV_SIZE);
+  if (blob.byteLength < offset + IV_SIZE + TAG_SIZE) {
+    throw new Error("Blob too short to be a valid encrypted field");
+  }
+  const iv = blob.slice(offset, offset + IV_SIZE);
+  const ciphertext = blob.slice(offset + IV_SIZE);
 
   const key = keyring.keys.get(version);
   if (!key) throw new Error(`Key version ${version} not found in keyring`);
 
-  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+  const params: AesGcmParams = additionalData ? { name: "AES-GCM", iv, additionalData } : { name: "AES-GCM", iv };
+  const plaintext = await crypto.subtle.decrypt(params, key, ciphertext);
   return new TextDecoder().decode(plaintext);
 }
 
