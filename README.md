@@ -20,8 +20,15 @@ do with the keyring itself.
 ## Quick start
 
 ```bash
-npm install github:infra-commons/d1-field-crypto
+# Pin to a full 40-character commit SHA from main, never the bare repo (that tracks mutable main).
+npm install github:infra-commons/d1-field-crypto#<full-commit-sha>
 ```
+
+The package is not on the npm registry, so install it from git and **pin an immutable ref**. An
+unpinned `github:` install follows whatever `main` points at on the next `npm install`, which is
+not what you want for a crypto dependency. Commit the resulting lockfile and bump the SHA
+deliberately, after reading the diff. `dist/` is not committed: npm builds it on install via the
+`prepare` script, so pick a commit that includes that script.
 
 ```typescript
 import { resolveKeyring, encryptField, decryptField, importIndexKey, blindIndex } from "@infra-commons/d1-field-crypto";
