@@ -53,6 +53,12 @@ describe("resolveKeyring", () => {
     await expect(resolveKeyring({ "0": KEY_V1 })).rejects.toThrow("1–255");
     await expect(resolveKeyring({ "256": KEY_V1 })).rejects.toThrow("1–255");
   });
+
+  it("rejects non-canonical version strings", async () => {
+    for (const v of ["01", "1abc", " 1", "1.0", "+1", ""]) {
+      await expect(resolveKeyring({ [v]: KEY_V1 })).rejects.toThrow("1–255");
+    }
+  });
 });
 
 describe("encryptField / decryptField", () => {
@@ -115,6 +121,12 @@ describe("encryptField / decryptField", () => {
   it("round-trips an empty string", async () => {
     const kr = await resolveKeyring({ "1": KEY_V1 });
     expect(await decryptField(await encryptField("", kr, CTX), kr, CTX)).toBe("");
+  });
+
+  it("round-trips a 512 KB field (no call-stack overflow when encoding)", async () => {
+    const kr = await resolveKeyring({ "1": KEY_V1 });
+    const text = "x".repeat(512 * 1024);
+    expect(await decryptField(await encryptField(text, kr, CTX), kr, CTX)).toBe(text);
   });
 });
 

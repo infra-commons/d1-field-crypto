@@ -56,7 +56,8 @@ export async function resolveKeyring(raw: KeyringRaw): Promise<ResolvedKeyring> 
   let activeVersion = 0;
 
   for (const [vStr, b64] of Object.entries(raw)) {
-    const version = parseInt(vStr, 10);
+    // Canonical decimal only: parseInt would let "01" collide with "1" and accept "1abc".
+    const version = /^[1-9][0-9]{0,2}$/.test(vStr) ? Number(vStr) : NaN;
     if (!Number.isInteger(version) || version < 1 || version > 255) {
       throw new Error(`Key version must be 1–255, got "${vStr}"`);
     }
@@ -86,6 +87,15 @@ function associatedData(header: Uint8Array, context: FieldContext): Uint8Array<A
   aad.set(header);
   aad.set(ctx, header.byteLength);
   return aad;
+}
+
+function encodeBlob(bytes: Uint8Array): string {
+  // Chunked: spreading a large array into fromCharCode overflows the call stack (~100 KB+).
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
+  }
+  return btoa(binary);
 }
 
 function decodeBlob(encoded: string): Uint8Array<ArrayBuffer> {
@@ -121,7 +131,7 @@ export async function encryptField(
   blob.set(iv, V2_HEADER_SIZE);
   blob.set(new Uint8Array(ciphertext), V2_HEADER_SIZE + IV_SIZE);
 
-  return btoa(String.fromCharCode(...blob));
+  return encodeBlob(blob);
 }
 
 /**
