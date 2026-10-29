@@ -24,11 +24,12 @@ npm install github:infra-commons/d1-field-crypto
 ```
 
 ```typescript
-import { resolveKeyring, encryptField, decryptField, importIndexKey, blindIndex } from "@infra-commons/d1-field-crypto";
+import { resolveKeyring, encryptField, decryptField, importIndexKey, blindIndex, normalizeIndexValue } from "@infra-commons/d1-field-crypto";
 
 // Initialise once at Worker startup (cache the resolved keyring)
 const keyring = await resolveKeyring(JSON.parse(env.D1_FIELD_KEYRING));
 const emailIdxKey = await importIndexKey(env.D1_EMAIL_INDEX_KEY);
+const EMAIL_IDX = { table: "users", column: "email_bidx", keyVersion: 1 }; // v2 blind-index domain
 ```
 
 ## Key management
@@ -77,13 +78,13 @@ await db.prepare(
 ).bind(
   id,
   await encryptField(user.email, keyring, ctx("email_enc")),
-  await blindIndex(user.email, emailIdxKey),
+  await blindIndex(user.email, emailIdxKey, EMAIL_IDX),
   await encryptField(user.name, keyring, ctx("name_enc")),
 ).run();
 
 // Read path
 const row = await db.prepare("SELECT id, email_enc, name_enc FROM users WHERE email_bidx = ?")
-  .bind(await blindIndex(lookupEmail, emailIdxKey))
+  .bind(await blindIndex(lookupEmail, emailIdxKey, EMAIL_IDX))
   .first();
 
 const email = await decryptField(row.email_enc, keyring, { table: "users", column: "email_enc", row: row.id });
@@ -98,9 +99,30 @@ a deterministic HMAC-SHA256 of the normalised value, stored in a sibling `email_
 
 - `email_bidx` should be `TEXT NOT NULL UNIQUE` — it enforces uniqueness and enables fast lookup.
 - The index key must be **different** from the encryption keyring key.
-- The helper normalises input (lowercase + trim) before hashing — `user@EXAMPLE.COM` and
-  `user@example.com` produce the same index.
-- Use a separate index key per indexed column.
+- Pass an `IndexDomain` (`{ table, column, keyVersion? }`) to get a **v2** index. v2 binds
+  the table and column into the HMAC, so equal values in two columns give different indexes even
+  if they share a key. It also normalises with trim + lowercase + **Unicode NFC**
+  (`normalizeIndexValue`), so `user@EXAMPLE.COM`, ` user@example.com ` and NFC/NFD spellings of the same
+  address all produce one index. The output is `bi2.<keyVersion>.<64 hex>`. Record the index key's version
+  in `keyVersion`, and stored rows then show which key produced them.
+- Without a domain, `blindIndex` keeps its **legacy** behaviour byte-for-byte: lowercase + trim
+  only, 64 hex chars, and no column binding. NFC/NFD variants of one address get different legacy
+  indexes, which slips past `UNIQUE`. Use the legacy form only to read indexes you already stored.
+- Still use a separate index key per indexed column. Domain separation is defence in depth, not a
+  licence to share keys.
+
+### Migrating stored legacy indexes to v2
+
+v2 output never equals legacy output, so switching blindly breaks lookups on existing rows.
+1. Deploy dual lookup: compute both forms, query `WHERE email_bidx IN (?, ?)` (v2, legacy), write
+   v2 on every insert/update, and rewrite a matched legacy value to v2. Until the backfill
+   finishes, `UNIQUE` cannot see a v2 value colliding with a legacy one, so check both forms
+   before inserting.
+2. Backfill: for each row still holding a 64-hex legacy value (`email_bidx NOT LIKE 'bi2.%'`),
+   decrypt the field with its context and store `blindIndex(value, key, domain)`. If two rows map
+   to the same v2 value, the `UNIQUE` constraint fails. That is an NFC/NFD duplicate the legacy
+   index let through, and it needs a manual merge.
+3. When no legacy values remain, drop the legacy half of the lookup.
 
 The blind index is **not** bound to the row: it must be the same for equal values across rows, or
 lookup is impossible. So a lookup by index only tells you which row *claims* the value. Before
@@ -109,7 +131,7 @@ with its own context and check it equals the normalised lookup value:
 
 ```typescript
 const stored = await decryptField(row.email_enc, keyring, { table: "users", column: "email_enc", row: row.id });
-if (stored.toLowerCase().trim() !== lookupEmail.toLowerCase().trim()) throw new Error("index mismatch");
+if (normalizeIndexValue(stored) !== normalizeIndexValue(lookupEmail)) throw new Error("index mismatch");
 // send mail to `stored`, never to the address the request supplied
 ```
 
@@ -188,6 +210,13 @@ isLegacyFormat(encoded: string): boolean
 // Import a 256-bit HMAC key for blind-index use
 importIndexKey(base64Key: string): Promise<CryptoKey>
 
-// Compute a deterministic HMAC-SHA256 blind index (normalised: lowercase+trim)
-blindIndex(value: string, indexKey: CryptoKey): Promise<string>
+type IndexDomain = { table: string; column: string; keyVersion?: number }  // keyVersion 1–255, default 1
+
+// Deterministic HMAC-SHA256 blind index.
+// With domain (v2): column-bound, trim+lowercase+NFC, returns "bi2.<keyVersion>.<64 hex>".
+// Without (legacy, unchanged): trim+lowercase, returns 64 hex chars.
+blindIndex(value: string, indexKey: CryptoKey, domain?: IndexDomain): Promise<string>
+
+// The v2 normaliser, for comparing a decrypted value with a lookup value
+normalizeIndexValue(value: string): string
 ```

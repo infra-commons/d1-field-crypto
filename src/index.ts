@@ -180,16 +180,65 @@ export async function importIndexKey(base64Key: string): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
 }
 
-/**
- * Compute a deterministic HMAC-SHA256 blind index for lookup / UNIQUE enforcement.
- * Normalises the value (lowercase + trim) before hashing.
- * Store this alongside the encrypted field; query with `WHERE email_bidx = ?`.
- * @returns  Lowercase hex string (64 chars).
- */
-export async function blindIndex(value: string, indexKey: CryptoKey): Promise<string> {
-  const encoded = new TextEncoder().encode(value.toLowerCase().trim());
-  const sig = await crypto.subtle.sign("HMAC", indexKey, encoded);
-  return Array.from(new Uint8Array(sig))
+/** Which column a v2 blind index belongs to. Bound into the HMAC input for domain separation. */
+export interface IndexDomain {
+  table: string;
+  column: string;
+  /** Version of the index key, recorded in the output so rows show which key produced them. Default 1. */
+  keyVersion?: number;
+}
+
+const BIDX_V2_TAG = "d1fc-bidx-v2";
+
+/** The v2 blind-index normaliser: trim, lowercase, Unicode NFC. Use it to compare decrypted values. */
+export function normalizeIndexValue(value: string): string {
+  return value.trim().toLowerCase().normalize("NFC");
+}
+
+function toHex(buf: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/** Length-prefix each part (4-byte big-endian) so no two (table, column, value) triples collide. */
+function encodeIndexInput(parts: string[]): Uint8Array<ArrayBuffer> {
+  const encoded = parts.map((p) => new TextEncoder().encode(p));
+  const out = new Uint8Array(encoded.reduce((n, e) => n + 4 + e.byteLength, 0));
+  const view = new DataView(out.buffer);
+  let offset = 0;
+  for (const e of encoded) {
+    view.setUint32(offset, e.byteLength);
+    out.set(e, offset + 4);
+    offset += 4 + e.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Compute a deterministic HMAC-SHA256 blind index for lookup / UNIQUE enforcement.
+ * Store this alongside the encrypted field; query with `WHERE email_bidx = ?`.
+ *
+ * Without `domain` (LEGACY, unchanged): normalises with lowercase + trim and returns 64 hex chars.
+ * Equal values collide across columns sharing an index key, and NFC/NFD variants differ.
+ *
+ * With `domain` (v2, recommended): binds table and column into the HMAC input, normalises with
+ * `normalizeIndexValue` (adds Unicode NFC) and returns `bi2.<keyVersion>.<64 hex>`.
+ * v2 output never equals legacy output; see the README for migrating stored indexes.
+ */
+export async function blindIndex(value: string, indexKey: CryptoKey, domain?: IndexDomain): Promise<string> {
+  if (domain === undefined) {
+    const encoded = new TextEncoder().encode(value.toLowerCase().trim());
+    return toHex(await crypto.subtle.sign("HMAC", indexKey, encoded));
+  }
+
+  const { table, column, keyVersion = 1 } = domain;
+  for (const [name, p] of [["table", table], ["column", column]] as const) {
+    if (typeof p !== "string" || p === "") throw new Error(`IndexDomain.${name} must be a non-empty string`);
+  }
+  if (!Number.isInteger(keyVersion) || keyVersion < 1 || keyVersion > 255) {
+    throw new Error(`IndexDomain.keyVersion must be 1–255, got ${keyVersion}`);
+  }
+  const input = encodeIndexInput([BIDX_V2_TAG, table, column, normalizeIndexValue(value)]);
+  return `bi2.${keyVersion}.${toHex(await crypto.subtle.sign("HMAC", indexKey, input))}`;
 }

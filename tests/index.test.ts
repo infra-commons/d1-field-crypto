@@ -5,6 +5,7 @@ import {
   decryptField,
   importIndexKey,
   blindIndex,
+  normalizeIndexValue,
   isLegacyFormat,
   type FieldContext,
   type KeyringRaw,
@@ -235,5 +236,56 @@ describe("blindIndex", () => {
 
   it("rejects a non-32-byte index key", async () => {
     await expect(importIndexKey(btoa("tooshort"))).rejects.toThrow("32 bytes");
+  });
+
+  it("keeps the legacy output byte-identical (no domain)", async () => {
+    // HMAC-SHA256(32 × 0x02, "hello@example.com"), computed independently with node:crypto.
+    const key = await importIndexKey(INDEX_KEY);
+    expect(await blindIndex("  Hello@Example.com ", key)).toBe(
+      "e4dad59b1696613f786f57a065f872f707ac044d6fdc88376de8f799fc0d8288",
+    );
+  });
+});
+
+describe("blindIndex v2 (with domain)", () => {
+  const EMAIL = { table: "users", column: "email_bidx" };
+
+  it("returns bi2.<keyVersion>.<64 hex>, never the legacy value", async () => {
+    const key = await importIndexKey(INDEX_KEY);
+    const v2 = await blindIndex("hello@example.com", key, EMAIL);
+    expect(v2).toMatch(/^bi2\.1\.[0-9a-f]{64}$/);
+    expect(v2.slice(6)).not.toBe(await blindIndex("hello@example.com", key));
+    expect(await blindIndex("hello@example.com", key, { ...EMAIL, keyVersion: 7 })).toBe(`bi2.7.${v2.slice(6)}`);
+  });
+
+  it("separates columns and tables that share an index key", async () => {
+    const key = await importIndexKey(INDEX_KEY);
+    const a = await blindIndex("same", key, EMAIL);
+    expect(await blindIndex("same", key, { table: "users", column: "phone_bidx" })).not.toBe(a);
+    expect(await blindIndex("same", key, { table: "admins", column: "email_bidx" })).not.toBe(a);
+  });
+
+  it("is unambiguous across part boundaries", async () => {
+    const key = await importIndexKey(INDEX_KEY);
+    const a = await blindIndex("x", key, { table: "ab", column: "c" });
+    const b = await blindIndex("x", key, { table: "a", column: "bc" });
+    expect(a).not.toBe(b);
+  });
+
+  it("treats NFC and NFD forms, case and whitespace as equal", async () => {
+    const key = await importIndexKey(INDEX_KEY);
+    const nfc = "josé@example.com";
+    const nfd = " JOSÉ@EXAMPLE.COM ";
+    expect(nfc).not.toBe(nfd.trim().toLowerCase());
+    expect(await blindIndex(nfd, key, EMAIL)).toBe(await blindIndex(nfc, key, EMAIL));
+    expect(normalizeIndexValue(nfd)).toBe(nfc);
+  });
+
+  it("validates the domain", async () => {
+    const key = await importIndexKey(INDEX_KEY);
+    await expect(blindIndex("x", key, { table: "", column: "c" })).rejects.toThrow("table");
+    await expect(blindIndex("x", key, { table: "t", column: "" })).rejects.toThrow("column");
+    await expect(blindIndex("x", key, { ...EMAIL, keyVersion: 0 })).rejects.toThrow("1–255");
+    await expect(blindIndex("x", key, { ...EMAIL, keyVersion: 1.5 })).rejects.toThrow("1–255");
   });
 });
