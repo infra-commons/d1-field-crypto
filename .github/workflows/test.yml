@@ -1,0 +1,52 @@
+name: Test
+
+# Installs from the lockfile, runs the real build and runs the test suite on every pull
+# request and on every push to main.
+#
+# The build step is `npm run build` (`tsc`, the same command `prepare` runs when this
+# package is installed from git), not a `--noEmit` typecheck. #14 found a broken build that
+# a noEmit typecheck had hidden, and only an emitting build catches that.
+#
+# Added on 2026-11-04 as an explicit operator exception to the 2026-09-03 harness freeze
+# (infra-commons/meta#1778).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No engines field or .nvmrc; 22 is the fleet default and satisfies vitest's range.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      # --ignore-scripts so `prepare` doesn't build here; the build gets its own step below.
+      - name: Install (lockfile-exact)
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Check build output
+        run: test -f dist/index.js && test -f dist/index.d.ts
+
+      - name: Test
+        run: npm test
